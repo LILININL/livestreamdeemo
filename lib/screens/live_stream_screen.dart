@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:livestreamdeemo/bloc/stream/stream_bloc.dart';
 import 'package:livestreamdeemo/bloc/stream/stream_event.dart';
@@ -6,8 +7,10 @@ import 'package:livestreamdeemo/bloc/stream/stream_state.dart';
 import 'package:livestreamdeemo/screens/dispose_test_screen.dart';
 import 'package:video_player/video_player.dart';
 import 'dart:async';
-import 'dart:io';
-import 'package:flutter/services.dart';
+import 'package:livestreamdeemo/utils/live_stream_helper.dart';
+import 'package:livestreamdeemo/services/video_service.dart';
+import 'package:livestreamdeemo/services/metrics_service.dart';
+import 'package:livestreamdeemo/services/screen_service.dart';
 
 class LiveStreamScreen extends StatefulWidget {
   final String uid;
@@ -20,11 +23,11 @@ class LiveStreamScreen extends StatefulWidget {
 }
 
 class _LiveStreamScreenState extends State<LiveStreamScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   VideoPlayerController? _videoController;
-  String? _errorMessage;
   int _retryCount = 0;
   static const int _maxRetries = 3;
+  String? _basePlaybackUrl;
 
   // Metrics variables
   Timer? _metricsTimer;
@@ -50,18 +53,67 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     '240p',
   ];
 
-  // Full screen state
+  // Full screen and control panel state
   bool _isFullScreen = false;
+  bool _showControlPanel = false;
+  late AnimationController _animationController;
+  late Animation<Offset> _slideAnimation;
+
+  // Connection status
+  String _connectionStatus = 'Connecting...';
+  Color _connectionStatusColor = Colors.orange;
+
+  late LiveStreamHelper _liveStreamHelper;
+  final VideoService _videoService = VideoService();
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
+    ScreenService.setAllOrientations();
+
+    // Hide system UI (navigation bar and status bar) for immersive experience
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.immersiveSticky,
+      overlays: [], // Hide all overlays including navigation bar
+    );
+
+    // Initialize animation controller for control panel slide
+    _animationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 300),
+    );
+    _slideAnimation = Tween<Offset>(begin: const Offset(0, 1), end: Offset.zero)
+        .animate(
+          CurvedAnimation(
+            parent: _animationController,
+            curve: Curves.easeInOut,
+          ),
+        );
+
+    // Autoplay the video when the screen is opened
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      debugPrint('LiveStreamScreen: initState - Adding LoadStream event with uid: ${widget.uid}, domain: ${widget.domain}');
+      context.read<StreamBloc>().add(LoadStream(widget.uid, widget.domain));
+    });
+
+    _liveStreamHelper = LiveStreamHelper(
+      videoController: _videoController,
+      onBufferUpdate: (bufferAhead) {
+        if (mounted) {
+          setState(() {
+            _bufferHealth = bufferAhead.inMilliseconds / 1000.0;
+          });
+        }
+      },
+      onLatencyUpdate: (latency) {
+        if (mounted) {
+          setState(() {
+            _latency = latency;
+          });
+        }
+      },
+    );
   }
 
   @override
@@ -69,7 +121,15 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     WidgetsBinding.instance.removeObserver(this);
     _metricsTimer?.cancel();
     _videoController?.dispose();
-    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    _animationController.dispose();
+    ScreenService.setPortraitOnly();
+    
+    // Restore system UI when leaving the screen
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.edgeToEdge,
+      overlays: SystemUiOverlay.values, // Show all overlays back
+    );
+    
     super.dispose();
   }
 
@@ -84,104 +144,58 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     }
   }
 
+  void _startMetricsMonitoring() {
+    debugPrint('LiveStreamScreen: Starting metrics monitoring');
+    _streamStartTime = DateTime.now();
+    
+    // Increase timer to 5 seconds to reduce performance issues significantly
+    _metricsTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      debugPrint('LiveStreamScreen: Metrics timer tick - mounted: $mounted, controller: ${_videoController != null}');
+      
+      if (mounted && _videoController != null) {
+        setState(() {
+          _latency = MetricsService.calculateLatency();
+          _bufferHealth = MetricsService.calculateBufferHealth(
+            _videoController,
+          );
+          _isBuffering = MetricsService.isBuffering(_videoController);
+
+          final metrics = MetricsService.updateVideoMetrics(
+            _videoController,
+            _currentQuality,
+            _latency,
+          );
+          _resolution = metrics['resolution'];
+          _frameRate = metrics['frameRate'];
+          _bitrate = metrics['bitrate'];
+          _networkSpeed = metrics['networkSpeed'];
+        });
+      }
+    });
+  }
+
   void _toggleFullScreen() {
     if (mounted) {
       setState(() {
         _isFullScreen = !_isFullScreen;
+        if (!_isFullScreen) {
+          _showControlPanel = false;
+          _animationController.reverse();
+        }
       });
     }
-
-    if (_isFullScreen) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-      SystemChrome.setPreferredOrientations([
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ]);
-    } else {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-      SystemChrome.setPreferredOrientations([
-        DeviceOrientation.portraitUp,
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ]);
-    }
+    ScreenService.toggleFullScreen(_isFullScreen);
   }
 
-  void _startMetricsMonitoring() {
-    _streamStartTime = DateTime.now();
-    _metricsTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      _updateMetrics();
-    });
-  }
-
-  void _updateMetrics() async {
-    if (_videoController != null && _videoController!.value.isInitialized) {
-      await _calculateLatency();
-
-      final buffered = _videoController!.value.buffered;
-      final position = _videoController!.value.position;
-
-      if (buffered.isNotEmpty) {
-        final bufferEnd = buffered.last.end;
-        final bufferAhead = bufferEnd - position;
-        _bufferHealth = bufferAhead.inMilliseconds / 1000.0;
-      }
-
-      final wasBuffering = _isBuffering;
-      _isBuffering =
-          !_videoController!.value.isPlaying &&
-          _videoController!.value.isInitialized &&
-          !_videoController!.value.hasError;
-
-      if (_isBuffering && !wasBuffering) {
-        // Started buffering
-      } else if (!_isBuffering && wasBuffering) {
-        _totalBufferDuration += const Duration(seconds: 1);
-      }
-
-      _updateVideoMetrics();
-
-      if (mounted) {
-        setState(() {});
-      }
-    }
-  }
-
-  Future<void> _calculateLatency() async {
-    try {
-      final stopwatch = Stopwatch()..start();
-      final result = await InternetAddress.lookup('google.com');
-      if (result.isNotEmpty && result[0].rawAddress.isNotEmpty) {
-        stopwatch.stop();
-        _latency = stopwatch.elapsedMilliseconds.toDouble();
-      }
-    } catch (e) {
-      _latency = -1;
-    }
-  }
-
-  void _updateVideoMetrics() {
-    if (_videoController != null && _videoController!.value.isInitialized) {
-      final size = _videoController!.value.size;
-      _resolution = '${size.width.toInt()}x${size.height.toInt()}';
-      _frameRate = 30.0;
-      _bitrate = '2.5 Mbps';
-      if (_latency < 50) {
-        _networkSpeed = 'Excellent';
-      } else if (_latency < 100) {
-        _networkSpeed = 'Good';
-      } else if (_latency < 200) {
-        _networkSpeed = 'Fair';
-      } else {
-        _networkSpeed = 'Poor';
-      }
-    }
-  }
-
-  void _changeQuality(String quality) {
+  void _toggleControlPanel() {
     if (mounted) {
       setState(() {
-        _currentQuality = quality;
+        _showControlPanel = !_showControlPanel;
+        if (_showControlPanel) {
+          _animationController.forward();
+        } else {
+          _animationController.reverse();
+        }
       });
     }
   }
@@ -192,6 +206,122 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
         _showMetrics = !_showMetrics;
       });
     }
+  }
+
+  Future<void> _initializeVideoController(String url) async {
+    debugPrint('=== LiveStreamScreen: _initializeVideoController START ===');
+    debugPrint('LiveStreamScreen: Received URL: $url');
+    debugPrint('LiveStreamScreen: URL validation: ${Uri.tryParse(url) != null ? "Valid" : "Invalid"}');
+    
+    if (mounted) {
+      setState(() {
+        _connectionStatus = 'Initializing...';
+        _connectionStatusColor = Colors.orange;
+      });
+    }
+
+    try {
+      debugPrint('LiveStreamScreen: Calling VideoService.initializeVideoController with URL: $url');
+      await _videoService.initializeVideoController(
+        url,
+        (errorMessage) {
+          debugPrint('=== LiveStreamScreen: VIDEO ERROR CALLBACK ===');
+          debugPrint('LiveStreamScreen: Video Error received: $errorMessage');
+          if (mounted) {
+            setState(() {
+              _connectionStatus = 'Error';
+              _connectionStatusColor = Colors.red;
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Video Error: $errorMessage')),
+            );
+          }
+        },
+        (videoController) {
+          debugPrint('=== LiveStreamScreen: VIDEO SUCCESS CALLBACK ===');
+          debugPrint('LiveStreamScreen: Video controller received successfully');
+          debugPrint('LiveStreamScreen: Video controller initialized: ${videoController.value.isInitialized}');
+          debugPrint('LiveStreamScreen: Video duration: ${videoController.value.duration}');
+          debugPrint('LiveStreamScreen: Video size: ${videoController.value.size}');
+          debugPrint('LiveStreamScreen: Video playing: ${videoController.value.isPlaying}');
+          
+          if (mounted) {
+            setState(() {
+              _videoController = videoController;
+              _retryCount = 0;
+              _connectionStatus = 'Connected';
+              _connectionStatusColor = Colors.green;
+            });
+            debugPrint('LiveStreamScreen: Starting video playback');
+            _videoController!.seekTo(Duration.zero);
+            _videoController!.play();
+            _startMetricsMonitoring();
+            debugPrint('LiveStreamScreen: Video playback started');
+          }
+        },
+      );
+      debugPrint('=== LiveStreamScreen: _initializeVideoController COMPLETED ===');
+    } catch (e) {
+      debugPrint('=== LiveStreamScreen: _initializeVideoController ERROR ===');
+      debugPrint('LiveStreamScreen: Initialize Video Controller Error: $e');
+      debugPrint('LiveStreamScreen: Error type: ${e.runtimeType}');
+      if (mounted) {
+        setState(() {
+          _connectionStatus = 'Failed';
+          _connectionStatusColor = Colors.red;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to initialize video: $e')),
+        );
+      }
+    }
+  }
+
+  void _retryStream() {
+    _metricsTimer?.cancel();
+    if (mounted) {
+      setState(() {
+        _retryCount = 0;
+        _videoController?.dispose();
+        _videoController = null;
+        _streamStartTime = null;
+        _showControlPanel = false;
+        _animationController.reverse();
+      });
+    }
+    if (mounted) {
+      context.read<StreamBloc>().add(LoadStream(widget.uid, widget.domain));
+    }
+  }
+
+  void _changeQuality(String quality) async {
+    if (mounted) {
+      setState(() {
+        _currentQuality = quality;
+      });
+    }
+
+    _metricsTimer?.cancel();
+    await _videoService.changeQuality(
+      quality,
+      _basePlaybackUrl,
+      _videoController,
+      (videoController) {
+        if (mounted) {
+          setState(() {
+            _videoController = videoController;
+          });
+        }
+        _startMetricsMonitoring();
+      },
+      (errorMessage) {
+        debugPrint('Quality Change Error: $errorMessage');
+      },
+    );
+  }
+
+  String _formatTime(Duration duration) {
+    return _liveStreamHelper.formatTime(duration);
   }
 
   Widget _buildMetricsOverlay() {
@@ -283,115 +413,177 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     );
   }
 
-  Widget _buildControlPanel() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.9),
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.3),
-            blurRadius: 8,
-            offset: const Offset(0, -2),
-          ),
-        ],
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              _buildControlButton(
-                icon:
-                    _videoController != null &&
-                        _videoController!.value.isPlaying
-                    ? Icons.pause
-                    : Icons.play_arrow,
-                label:
-                    _videoController != null &&
-                        _videoController!.value.isPlaying
-                    ? 'Pause'
-                    : 'Play',
-                onPressed: () {
-                  if (mounted) {
-                    setState(() {
-                      if (_videoController != null &&
-                          _videoController!.value.isInitialized) {
-                        _videoController!.value.isPlaying
-                            ? _videoController!.pause()
-                            : _videoController!.play();
-                      }
-                    });
-                  }
-                },
+  Widget _buildVideoOverlay() {
+    if (_videoController == null || !_videoController!.value.isInitialized) {
+      return const SizedBox.shrink();
+    }
+
+    final position = _videoController!.value.position;
+    final duration = _videoController!.value.duration;
+    final isLive = position >= duration - const Duration(seconds: 2);
+
+    return Positioned(
+      top: 16,
+      left: 16,
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.7),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              isLive ? 'LIVE' : 'Playing',
+              style: TextStyle(
+                color: isLive ? Colors.red : Colors.green,
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
               ),
-              _buildControlButton(
-                icon: Icons.refresh,
-                label: 'Reload',
-                onPressed: _retryStream,
-              ),
-              _buildControlButton(
-                icon: _showMetrics ? Icons.visibility_off : Icons.visibility,
-                label: _showMetrics ? 'Hide Info' : 'Show Info',
-                onPressed: _toggleMetricsDisplay,
-              ),
-              _buildControlButton(
-                icon: _isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen,
-                label: _isFullScreen ? 'Exit Full' : 'Full Screen',
-                onPressed: _toggleFullScreen,
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          const Text(
-            'Quality:',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
             ),
-          ),
-          const SizedBox(height: 8),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              children: _qualityOptions
-                  .map(
-                    (quality) => Padding(
-                      padding: const EdgeInsets.only(right: 8),
-                      child: ElevatedButton(
-                        onPressed: () => _changeQuality(quality),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _currentQuality == quality
-                              ? Colors.blue
-                              : Colors.grey[800],
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 8,
+            const SizedBox(height: 4),
+            Text(
+              'Quality: $_currentQuality',
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '${_formatTime(position)} / ${_formatTime(duration)}',
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildControlPanel() {
+    return SlideTransition(
+      position: _slideAnimation,
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.9),
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.3),
+              blurRadius: 8,
+              offset: const Offset(0, -2),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 8),
+                decoration: BoxDecoration(
+                  color: Colors.white54,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            _buildProgressBar(),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                _buildControlButton(
+                  icon:
+                      _videoController != null &&
+                          _videoController!.value.isPlaying
+                      ? Icons.pause
+                      : Icons.play_arrow,
+                  label:
+                      _videoController != null &&
+                          _videoController!.value.isPlaying
+                      ? 'Pause'
+                      : 'Play',
+                  onPressed: () {
+                    if (mounted) {
+                      setState(() {
+                        if (_videoController != null &&
+                            _videoController!.value.isInitialized) {
+                          _videoController!.value.isPlaying
+                              ? _videoController!.pause()
+                              : _videoController!.play();
+                        }
+                      });
+                    }
+                  },
+                ),
+                _buildControlButton(
+                  icon: Icons.refresh,
+                  label: 'Reload',
+                  onPressed: _retryStream,
+                ),
+                _buildControlButton(
+                  icon: _showMetrics ? Icons.visibility_off : Icons.visibility,
+                  label: _showMetrics ? 'Hide Info' : 'Show Info',
+                  onPressed: _toggleMetricsDisplay,
+                ),
+                _buildControlButton(
+                  icon: _isFullScreen
+                      ? Icons.fullscreen_exit
+                      : Icons.fullscreen,
+                  label: _isFullScreen ? 'Exit Full' : 'Full Screen',
+                  onPressed: _toggleFullScreen,
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Quality:',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 8),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: _qualityOptions
+                    .map(
+                      (quality) => Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: ElevatedButton(
+                          onPressed: () => _changeQuality(quality),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _currentQuality == quality
+                                ? Colors.blue
+                                : Colors.grey[800],
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 8,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
                           ),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
+                          child: Text(
+                            quality,
+                            style: const TextStyle(fontSize: 12),
                           ),
-                        ),
-                        child: Text(
-                          quality,
-                          style: const TextStyle(fontSize: 12),
                         ),
                       ),
-                    ),
-                  )
-                  .toList(),
+                    )
+                    .toList(),
+              ),
             ),
-          ),
-          if (_showMetrics) ...[
-            const Divider(color: Colors.white54, height: 24),
-            _buildDetailedMetrics(),
+            if (_showMetrics) ...[
+              const Divider(color: Colors.white54, height: 24),
+              _buildDetailedMetrics(),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
@@ -509,83 +701,138 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     );
   }
 
-  Future<void> _initializeVideoController(String url) async {
-    try {
-      _videoController = VideoPlayerController.networkUrl(
-        Uri.parse(url),
-        videoPlayerOptions: VideoPlayerOptions(
-          allowBackgroundPlayback: false,
-          mixWithOthers: true,
-        ),
-        httpHeaders: {
-          'Accept': 'application/vnd.apple.mpegurl',
-          'User-Agent': 'Flutter/LiveStreamDemo',
-        },
-      );
-
-      await _videoController!.initialize().timeout(
-        const Duration(seconds: 10),
-        onTimeout: () {
-          throw Exception('Video initialization timed out');
-        },
-      );
-
-      if (mounted) {
-        setState(() {
-          _errorMessage = null;
-          _retryCount = 0;
-          _videoController!.play();
-        });
-      }
-
-      _startMetricsMonitoring();
-
-      _videoController!.addListener(() {
-        if (_videoController!.value.hasError && mounted) {
-          setState(() {
-            _errorMessage =
-                'Video error: ${_videoController!.value.errorDescription}';
-          });
-        }
-      });
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _errorMessage = 'Failed to load stream: $e';
-        });
-      }
-      if (_retryCount < _maxRetries) {
-        _retryCount++;
-        Future.delayed(const Duration(seconds: 2), () {
-          if (mounted) {
-            context.read<StreamBloc>().add(
-              LoadStream(widget.uid, widget.domain),
-            );
-          }
-        });
-      }
+  Widget _buildProgressBar() {
+    if (_videoController == null || !_videoController!.value.isInitialized) {
+      return const SizedBox.shrink();
     }
+
+    final position = _videoController!.value.position;
+    final duration = _videoController!.value.duration;
+    final isLive = position >= duration - const Duration(seconds: 2);
+
+    return GestureDetector(
+      onHorizontalDragUpdate: (details) {
+        if (_videoController != null && _videoController!.value.isInitialized) {
+          final newPosition =
+              position +
+              Duration(milliseconds: (details.primaryDelta! * 100).toInt());
+          final clampedPosition = newPosition < Duration.zero
+              ? Duration.zero
+              : (newPosition > duration ? duration : newPosition);
+          _videoController!.seekTo(clampedPosition);
+        }
+      },
+      onTapDown: (details) {
+        if (_videoController != null && _videoController!.value.isInitialized) {
+          final tapPosition = details.localPosition.dx;
+          final screenWidth = MediaQuery.of(context).size.width;
+          final newPosition = Duration(
+            milliseconds: (tapPosition / screenWidth * duration.inMilliseconds)
+                .toInt(),
+          );
+          _videoController!.seekTo(newPosition);
+        }
+      },
+      child: Column(
+        children: [
+          LinearProgressIndicator(
+            value: isLive
+                ? null
+                : position.inMilliseconds / duration.inMilliseconds,
+            backgroundColor: Colors.grey,
+            valueColor: AlwaysStoppedAnimation(
+              isLive ? Colors.red : Colors.blue,
+            ),
+            minHeight: 4,
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  _formatTime(position),
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+                Text(
+                  isLive ? 'LIVE' : _formatTime(duration),
+                  style: TextStyle(
+                    color: isLive ? Colors.red : Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
-  Future<void> _retryStream() async {
-    _metricsTimer?.cancel();
-    if (mounted) {
-      setState(() {
-        _errorMessage = null;
-        _retryCount = 0;
-        _videoController?.dispose();
-        _videoController = null;
-        _streamStartTime = null;
-      });
-    }
-    if (mounted) {
-      context.read<StreamBloc>().add(LoadStream(widget.uid, widget.domain));
-    }
+  Widget _buildConnectionStatus() {
+    return Positioned(
+      top: 16,
+      right: 16,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.7),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: _connectionStatusColor, width: 1),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: _connectionStatusColor,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Text(
+              _connectionStatus,
+              style: TextStyle(
+                color: _connectionStatusColor,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLiveIndicator() {
+    return Positioned(
+      top: 60, // Move below connection status
+      right: 16,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: Colors.red,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Text(
+          'LIVE',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Colors.black, // Set background to black for immersive experience
       appBar: _isFullScreen
           ? null
           : AppBar(
@@ -620,18 +867,58 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
             ),
       body: BlocConsumer<StreamBloc, StreamState>(
         listener: (context, state) async {
+          debugPrint('LiveStreamScreen: BlocConsumer listener received state: ${state.runtimeType}');
+          debugPrint('LiveStreamScreen: Stream State: $state');
+          
           if (state is StreamLoaded) {
-            await _initializeVideoController(state.playbackUrl);
-          } else if (state is StreamError) {
+            debugPrint('=== LiveStreamScreen: StreamLoaded Event ===');
+            debugPrint('LiveStreamScreen: Raw URL from Bloc: ${state.playbackUrl}');
+            debugPrint('LiveStreamScreen: URL Length: ${state.playbackUrl.length} characters');
+            debugPrint('LiveStreamScreen: Current Quality Setting: $_currentQuality');
+            
             if (mounted) {
               setState(() {
-                _errorMessage = state.message;
+                _connectionStatus = 'Loading video...';
+                _connectionStatusColor = Colors.blue;
               });
+            }
+            
+            _basePlaybackUrl = state.playbackUrl;
+            String url = _currentQuality == 'Auto'
+                ? state.playbackUrl
+                : Uri.parse(state.playbackUrl)
+                      .replace(
+                        queryParameters: {
+                          'quality': _currentQuality.toLowerCase(),
+                        },
+                      )
+                      .toString();
+            
+            debugPrint('LiveStreamScreen: Final URL for video player: $url');
+            debugPrint('LiveStreamScreen: URL modified for quality: ${url != state.playbackUrl}');
+            debugPrint('LiveStreamScreen: About to call _initializeVideoController');
+            debugPrint('=== LiveStreamScreen: Calling Video Initialization ===');
+            
+            await _initializeVideoController(url);
+          } else if (state is StreamError) {
+            debugPrint('LiveStreamScreen: Stream Error: ${state.message}');
+            if (mounted) {
+              setState(() {
+                _connectionStatus = 'Stream Error';
+                _connectionStatusColor = Colors.red;
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Stream Error: ${state.message}')),
+              );
             }
             if (_retryCount < _maxRetries) {
               _retryCount++;
               Future.delayed(const Duration(seconds: 2), () {
                 if (mounted) {
+                  setState(() {
+                    _connectionStatus = 'Retrying...';
+                    _connectionStatusColor = Colors.orange;
+                  });
                   context.read<StreamBloc>().add(
                     LoadStream(widget.uid, widget.domain),
                   );
@@ -643,53 +930,126 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
         builder: (context, state) {
           return OrientationBuilder(
             builder: (context, orientation) {
-              return Column(
+              return Stack(
                 children: [
-                  Expanded(
-                    child: GestureDetector(
-                      onDoubleTap: _toggleFullScreen,
-                      child: Stack(
-                        children: [
-                          Container(
+                  Column(
+                    children: [
+                      Expanded(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () {
+                            debugPrint(
+                              'Screen tapped - current showControlPanel: $_showControlPanel',
+                            );
+                            if (mounted) {
+                              setState(() {
+                                _showControlPanel = !_showControlPanel;
+                                if (_showControlPanel) {
+                                  _animationController.forward();
+                                  // Hide after 5 seconds
+                                  Future.delayed(
+                                    const Duration(seconds: 5),
+                                    () {
+                                      if (mounted && _showControlPanel) {
+                                        setState(() {
+                                          _showControlPanel = false;
+                                          _animationController.reverse();
+                                        });
+                                      }
+                                    },
+                                  );
+                                } else {
+                                  _animationController.reverse();
+                                }
+                              });
+                            }
+                          },
+                          child: Container(
+                            width: double.infinity,
+                            height: double.infinity,
                             color: Colors.black,
-                            child:
-                                _videoController != null &&
-                                    _videoController!.value.isInitialized
-                                ? AspectRatio(
-                                    aspectRatio:
-                                        _videoController!.value.aspectRatio,
-                                    child: VideoPlayer(_videoController!),
+                            child: Stack(
+                              children: [
+                                // Video Player
+                                if (_videoController != null &&
+                                    _videoController!.value.isInitialized)
+                                  Center(
+                                    child: AspectRatio(
+                                      aspectRatio:
+                                          _videoController!.value.aspectRatio,
+                                      child: VideoPlayer(_videoController!),
+                                    ),
                                   )
-                                : Center(
-                                    child: Text(
-                                      _errorMessage ?? 'Waiting for stream...',
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.w500,
-                                      ),
+                                else
+                                  Center(
+                                    child: Column(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        const CircularProgressIndicator(
+                                          valueColor:
+                                              AlwaysStoppedAnimation<Color>(
+                                                Colors.red,
+                                              ),
+                                        ),
+                                        const SizedBox(height: 16),
+                                        Text(
+                                          _connectionStatus,
+                                          style: const TextStyle(
+                                            color: Colors.red,
+                                            fontSize: 14,
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
-                          ),
-                          _buildMetricsOverlay(),
-                          if (!_isFullScreen)
-                            Positioned(
-                              bottom: 16,
-                              right: 16,
-                              child: IconButton(
-                                icon: const Icon(
-                                  Icons.fullscreen,
-                                  color: Colors.white,
-                                  size: 30,
-                                ),
-                                onPressed: _toggleFullScreen,
-                              ),
+                                _buildVideoOverlay(),
+                              ],
                             ),
-                        ],
+                          ),
+                        ),
+                      ),
+                      _buildProgressBar(),
+                    ],
+                  ),
+                  _buildMetricsOverlay(),
+                  _buildConnectionStatus(),
+                  if (!_isFullScreen)
+                    Positioned(
+                      bottom: 16,
+                      right: 16,
+                      child: IconButton(
+                        icon: const Icon(
+                          Icons.fullscreen,
+                          color: Colors.white,
+                          size: 30,
+                        ),
+                        onPressed: _toggleFullScreen,
                       ),
                     ),
-                  ),
-                  _buildControlPanel(),
+                  if (_showControlPanel)
+                    Align(
+                      alignment: Alignment.bottomCenter,
+                      child: _buildControlPanel(),
+                    ),
+                  if (!_showControlPanel && !_isFullScreen)
+                    Positioned(
+                      bottom: 16,
+                      left: 0,
+                      right: 0,
+                      child: Center(
+                        child: IconButton(
+                          icon: const Icon(
+                            Icons.keyboard_arrow_up,
+                            color: Colors.white,
+                            size: 30,
+                          ),
+                          onPressed: _toggleControlPanel,
+                          tooltip: 'Show Controls',
+                        ),
+                      ),
+                    ),
+                  _buildLiveIndicator(),
                 ],
               );
             },
