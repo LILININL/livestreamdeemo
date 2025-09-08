@@ -38,6 +38,8 @@ dependencies:
   equatable: ^2.0.7
   flutter_bloc: ^9.1.1
   video_player: ^2.10.0
+  chewie: ^1.12.1
+  floating: ^6.0.0
 
 dev_dependencies:
   flutter_test:

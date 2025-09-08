@@ -7,10 +7,12 @@ import 'package:livestreamdeemo/bloc/stream/stream_state.dart';
 import 'package:livestreamdeemo/screens/dispose_test_screen.dart';
 import 'package:video_player/video_player.dart';
 import 'dart:async';
+import 'dart:io';
 import 'package:livestreamdeemo/utils/live_stream_helper.dart';
 import 'package:livestreamdeemo/services/video_service.dart';
 import 'package:livestreamdeemo/services/metrics_service.dart';
 import 'package:livestreamdeemo/services/screen_service.dart';
+import 'package:floating/floating.dart';
 
 class LiveStreamScreen extends StatefulWidget {
   final String uid;
@@ -56,6 +58,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
   // Full screen and control panel state
   bool _isFullScreen = false;
   bool _showControlPanel = false;
+  bool _isPiPMode = false;
   late AnimationController _animationController;
   late Animation<Offset> _slideAnimation;
 
@@ -65,6 +68,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
 
   late LiveStreamHelper _liveStreamHelper;
   final VideoService _videoService = VideoService();
+
+  // Floating package for PiP
+  final Floating _floating = Floating();
 
   @override
   void initState() {
@@ -77,7 +83,6 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
       SystemUiMode.immersiveSticky,
       overlays: [], // Hide all overlays including navigation bar
     );
-
     // Initialize animation controller for control panel slide
     _animationController = AnimationController(
       vsync: this,
@@ -93,7 +98,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
 
     // Autoplay the video when the screen is opened
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      debugPrint('LiveStreamScreen: initState - Adding LoadStream event with uid: ${widget.uid}, domain: ${widget.domain}');
+      debugPrint(
+        'LiveStreamScreen: initState - Adding LoadStream event with uid: ${widget.uid}, domain: ${widget.domain}',
+      );
       context.read<StreamBloc>().add(LoadStream(widget.uid, widget.domain));
     });
 
@@ -123,13 +130,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     _videoController?.dispose();
     _animationController.dispose();
     ScreenService.setPortraitOnly();
-    
+
     // Restore system UI when leaving the screen
     SystemChrome.setEnabledSystemUIMode(
       SystemUiMode.edgeToEdge,
       overlays: SystemUiOverlay.values, // Show all overlays back
     );
-    
+
     super.dispose();
   }
 
@@ -138,6 +145,12 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     if (state == AppLifecycleState.paused) {
       _videoController?.pause();
     } else if (state == AppLifecycleState.resumed) {
+      // When app resumes, exit PiP mode
+      if (_isPiPMode && mounted) {
+        setState(() {
+          _isPiPMode = false;
+        });
+      }
       if (_videoController != null && _videoController!.value.isInitialized) {
         _videoController!.play();
       }
@@ -147,11 +160,13 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
   void _startMetricsMonitoring() {
     debugPrint('LiveStreamScreen: Starting metrics monitoring');
     _streamStartTime = DateTime.now();
-    
+
     // Increase timer to 5 seconds to reduce performance issues significantly
     _metricsTimer = Timer.periodic(const Duration(seconds: 5), (timer) {
-      debugPrint('LiveStreamScreen: Metrics timer tick - mounted: $mounted, controller: ${_videoController != null}');
-      
+      debugPrint(
+        'LiveStreamScreen: Metrics timer tick - mounted: $mounted, controller: ${_videoController != null}',
+      );
+
       if (mounted && _videoController != null) {
         setState(() {
           _latency = MetricsService.calculateLatency();
@@ -208,11 +223,101 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     }
   }
 
+  Future<void> _enterPiPMode() async {
+    debugPrint('=== PiP Button Pressed ===');
+
+    try {
+      if (_videoController != null && _videoController!.value.isInitialized) {
+        // Check platform and use appropriate PiP implementation
+        if (Platform.isAndroid) {
+          debugPrint('Attempting to enable floating PiP on Android...');
+
+          // Check if PiP is available first
+          final bool isPipAvailable = await _floating.isPipAvailable;
+          if (!isPipAvailable) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Picture-in-Picture is not available on this device',
+                  ),
+                ),
+              );
+            }
+            return;
+          }
+
+          // Enable PiP using floating package with landscape aspect ratio
+          final pipStatus = await _floating.enable(
+            ImmediatePiP(
+              aspectRatio:
+                  const Rational.landscape(), // 16:9 aspect ratio for video
+            ),
+          );
+
+          if (pipStatus == PiPStatus.enabled) {
+            if (mounted) {
+              setState(() {
+                _isPiPMode = true;
+              });
+
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Picture-in-Picture mode activated'),
+                  duration: Duration(seconds: 2),
+                ),
+              );
+            }
+          } else {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Failed to activate Picture-in-Picture mode'),
+                ),
+              );
+            }
+          }
+        } else {
+          // iOS and other platforms - floating package only supports Android
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Picture-in-Picture is currently supported on Android only',
+                ),
+                duration: Duration(seconds: 3),
+              ),
+            );
+          }
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Video not ready for PiP mode')),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('PiP Error: $e');
+
+      if (mounted) {
+        setState(() {
+          _isPiPMode = false;
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('PiP Error: $e')));
+      }
+    }
+  }
+
   Future<void> _initializeVideoController(String url) async {
     debugPrint('=== LiveStreamScreen: _initializeVideoController START ===');
     debugPrint('LiveStreamScreen: Received URL: $url');
-    debugPrint('LiveStreamScreen: URL validation: ${Uri.tryParse(url) != null ? "Valid" : "Invalid"}');
-    
+    debugPrint(
+      'LiveStreamScreen: URL validation: ${Uri.tryParse(url) != null ? "Valid" : "Invalid"}',
+    );
+
     if (mounted) {
       setState(() {
         _connectionStatus = 'Initializing...';
@@ -221,7 +326,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
     }
 
     try {
-      debugPrint('LiveStreamScreen: Calling VideoService.initializeVideoController with URL: $url');
+      debugPrint(
+        'LiveStreamScreen: Calling VideoService.initializeVideoController with URL: $url',
+      );
       await _videoService.initializeVideoController(
         url,
         (errorMessage) {
@@ -239,12 +346,22 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
         },
         (videoController) {
           debugPrint('=== LiveStreamScreen: VIDEO SUCCESS CALLBACK ===');
-          debugPrint('LiveStreamScreen: Video controller received successfully');
-          debugPrint('LiveStreamScreen: Video controller initialized: ${videoController.value.isInitialized}');
-          debugPrint('LiveStreamScreen: Video duration: ${videoController.value.duration}');
-          debugPrint('LiveStreamScreen: Video size: ${videoController.value.size}');
-          debugPrint('LiveStreamScreen: Video playing: ${videoController.value.isPlaying}');
-          
+          debugPrint(
+            'LiveStreamScreen: Video controller received successfully',
+          );
+          debugPrint(
+            'LiveStreamScreen: Video controller initialized: ${videoController.value.isInitialized}',
+          );
+          debugPrint(
+            'LiveStreamScreen: Video duration: ${videoController.value.duration}',
+          );
+          debugPrint(
+            'LiveStreamScreen: Video size: ${videoController.value.size}',
+          );
+          debugPrint(
+            'LiveStreamScreen: Video playing: ${videoController.value.isPlaying}',
+          );
+
           if (mounted) {
             setState(() {
               _videoController = videoController;
@@ -260,7 +377,9 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
           }
         },
       );
-      debugPrint('=== LiveStreamScreen: _initializeVideoController COMPLETED ===');
+      debugPrint(
+        '=== LiveStreamScreen: _initializeVideoController COMPLETED ===',
+      );
     } catch (e) {
       debugPrint('=== LiveStreamScreen: _initializeVideoController ERROR ===');
       debugPrint('LiveStreamScreen: Initialize Video Controller Error: $e');
@@ -317,6 +436,48 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
       (errorMessage) {
         debugPrint('Quality Change Error: $errorMessage');
       },
+    );
+  }
+
+  Widget _buildVideoPlayer() {
+    if (_videoController == null || !_videoController!.value.isInitialized) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const CircularProgressIndicator(
+              valueColor: AlwaysStoppedAnimation<Color>(Colors.red),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              _connectionStatus,
+              style: const TextStyle(color: Colors.red, fontSize: 14),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // For PiP mode, show video in full screen without any UI elements
+    if (_isPiPMode) {
+      return SizedBox.expand(
+        child: FittedBox(
+          fit: BoxFit.cover,
+          child: SizedBox(
+            width: _videoController!.value.size.width,
+            height: _videoController!.value.size.height,
+            child: VideoPlayer(_videoController!),
+          ),
+        ),
+      );
+    }
+
+    // Normal mode with AspectRatio
+    return Center(
+      child: AspectRatio(
+        aspectRatio: _videoController!.value.aspectRatio,
+        child: VideoPlayer(_videoController!),
+      ),
     );
   }
 
@@ -533,6 +694,11 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
                       : Icons.fullscreen,
                   label: _isFullScreen ? 'Exit Full' : 'Full Screen',
                   onPressed: _toggleFullScreen,
+                ),
+                _buildControlButton(
+                  icon: Icons.picture_in_picture_alt,
+                  label: 'PiP',
+                  onPressed: _enterPiPMode,
                 ),
               ],
             ),
@@ -831,8 +997,14 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
 
   @override
   Widget build(BuildContext context) {
+    // If in PiP mode, show only the video player without any UI
+    if (_isPiPMode) {
+      return Scaffold(backgroundColor: Colors.black, body: _buildVideoPlayer());
+    }
+
     return Scaffold(
-      backgroundColor: Colors.black, // Set background to black for immersive experience
+      backgroundColor:
+          Colors.black, // Set background to black for immersive experience
       appBar: _isFullScreen
           ? null
           : AppBar(
@@ -867,22 +1039,30 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
             ),
       body: BlocConsumer<StreamBloc, StreamState>(
         listener: (context, state) async {
-          debugPrint('LiveStreamScreen: BlocConsumer listener received state: ${state.runtimeType}');
+          debugPrint(
+            'LiveStreamScreen: BlocConsumer listener received state: ${state.runtimeType}',
+          );
           debugPrint('LiveStreamScreen: Stream State: $state');
-          
+
           if (state is StreamLoaded) {
             debugPrint('=== LiveStreamScreen: StreamLoaded Event ===');
-            debugPrint('LiveStreamScreen: Raw URL from Bloc: ${state.playbackUrl}');
-            debugPrint('LiveStreamScreen: URL Length: ${state.playbackUrl.length} characters');
-            debugPrint('LiveStreamScreen: Current Quality Setting: $_currentQuality');
-            
+            debugPrint(
+              'LiveStreamScreen: Raw URL from Bloc: ${state.playbackUrl}',
+            );
+            debugPrint(
+              'LiveStreamScreen: URL Length: ${state.playbackUrl.length} characters',
+            );
+            debugPrint(
+              'LiveStreamScreen: Current Quality Setting: $_currentQuality',
+            );
+
             if (mounted) {
               setState(() {
                 _connectionStatus = 'Loading video...';
                 _connectionStatusColor = Colors.blue;
               });
             }
-            
+
             _basePlaybackUrl = state.playbackUrl;
             String url = _currentQuality == 'Auto'
                 ? state.playbackUrl
@@ -893,12 +1073,18 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
                         },
                       )
                       .toString();
-            
+
             debugPrint('LiveStreamScreen: Final URL for video player: $url');
-            debugPrint('LiveStreamScreen: URL modified for quality: ${url != state.playbackUrl}');
-            debugPrint('LiveStreamScreen: About to call _initializeVideoController');
-            debugPrint('=== LiveStreamScreen: Calling Video Initialization ===');
-            
+            debugPrint(
+              'LiveStreamScreen: URL modified for quality: ${url != state.playbackUrl}',
+            );
+            debugPrint(
+              'LiveStreamScreen: About to call _initializeVideoController',
+            );
+            debugPrint(
+              '=== LiveStreamScreen: Calling Video Initialization ===',
+            );
+
             await _initializeVideoController(url);
           } else if (state is StreamError) {
             debugPrint('LiveStreamScreen: Stream Error: ${state.message}');
@@ -970,51 +1156,19 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
                             color: Colors.black,
                             child: Stack(
                               children: [
-                                // Video Player
-                                if (_videoController != null &&
-                                    _videoController!.value.isInitialized)
-                                  Center(
-                                    child: AspectRatio(
-                                      aspectRatio:
-                                          _videoController!.value.aspectRatio,
-                                      child: VideoPlayer(_videoController!),
-                                    ),
-                                  )
-                                else
-                                  Center(
-                                    child: Column(
-                                      mainAxisAlignment:
-                                          MainAxisAlignment.center,
-                                      children: [
-                                        const CircularProgressIndicator(
-                                          valueColor:
-                                              AlwaysStoppedAnimation<Color>(
-                                                Colors.red,
-                                              ),
-                                        ),
-                                        const SizedBox(height: 16),
-                                        Text(
-                                          _connectionStatus,
-                                          style: const TextStyle(
-                                            color: Colors.red,
-                                            fontSize: 14,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                _buildVideoOverlay(),
+                                _buildVideoPlayer(),
+                                if (!_isPiPMode) _buildVideoOverlay(),
                               ],
                             ),
                           ),
                         ),
                       ),
-                      _buildProgressBar(),
+                      if (!_isPiPMode) _buildProgressBar(),
                     ],
                   ),
-                  _buildMetricsOverlay(),
-                  _buildConnectionStatus(),
-                  if (!_isFullScreen)
+                  if (!_isPiPMode) _buildMetricsOverlay(),
+                  if (!_isPiPMode) _buildConnectionStatus(),
+                  if (!_isFullScreen && !_isPiPMode)
                     Positioned(
                       bottom: 16,
                       right: 16,
@@ -1027,12 +1181,12 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
                         onPressed: _toggleFullScreen,
                       ),
                     ),
-                  if (_showControlPanel)
+                  if (_showControlPanel && !_isPiPMode)
                     Align(
                       alignment: Alignment.bottomCenter,
                       child: _buildControlPanel(),
                     ),
-                  if (!_showControlPanel && !_isFullScreen)
+                  if (!_showControlPanel && !_isFullScreen && !_isPiPMode)
                     Positioned(
                       bottom: 16,
                       left: 0,
@@ -1049,7 +1203,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
                         ),
                       ),
                     ),
-                  _buildLiveIndicator(),
+                  if (!_isPiPMode) _buildLiveIndicator(),
                 ],
               );
             },
