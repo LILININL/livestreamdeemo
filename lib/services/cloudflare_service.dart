@@ -9,7 +9,10 @@ class CloudflareService {
     debugPrint('CloudflareService: Domain Length: ${domain.length} characters');
 
     try {
-      final playbackUrl = '$domain/$uid/manifest/video.m3u8';
+      // final playbackUrl = '$domain/$uid/manifest/video.m3u8';
+
+      final playbackUrl =
+          'https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8';
       debugPrint('CloudflareService: Generated playback URL: $playbackUrl');
       debugPrint(
         'CloudflareService: Final URL Length: ${playbackUrl.length} characters',

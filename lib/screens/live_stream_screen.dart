@@ -30,6 +30,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
   int _retryCount = 0;
   static const int _maxRetries = 3;
   String? _basePlaybackUrl;
+  String? _currentStreamUrl; // For iOS PiP native controller
 
   // Metrics variables
   Timer? _metricsTimer;
@@ -71,6 +72,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
 
   // Floating package for PiP
   final Floating _floating = Floating();
+  static const MethodChannel _iosPipChannel = MethodChannel('pip_ios');
 
   @override
   void initState() {
@@ -143,12 +145,24 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused) {
-      _videoController?.pause();
+      if (Platform.isIOS) {
+        // Try to start PiP when app goes to background on iOS
+        _iosPipChannel.invokeMethod('startPiP').catchError((e) {
+          debugPrint('iOS startPiP error: $e');
+        });
+      } else {
+        _videoController?.pause();
+      }
     } else if (state == AppLifecycleState.resumed) {
-      // When app resumes, exit PiP mode
+      // When app resumes, exit PiP mode (Android flag) and stop PiP on iOS
       if (_isPiPMode && mounted) {
         setState(() {
           _isPiPMode = false;
+        });
+      }
+      if (Platform.isIOS) {
+        _iosPipChannel.invokeMethod('stopPiP').catchError((e) {
+          debugPrint('iOS stopPiP error: $e');
         });
       }
       if (_videoController != null && _videoController!.value.isInitialized) {
@@ -277,13 +291,24 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
               );
             }
           }
+        } else if (Platform.isIOS) {
+          // iOS: ask native to start PiP now
+          await _iosPipChannel.invokeMethod('startPiP');
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Picture-in-Picture requested on iOS'),
+                duration: Duration(seconds: 2),
+              ),
+            );
+          }
         } else {
-          // iOS and other platforms - floating package only supports Android
+          // Other platforms not supported
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(
                 content: Text(
-                  'Picture-in-Picture is currently supported on Android only',
+                  'Picture-in-Picture not supported on this platform',
                 ),
                 duration: Duration(seconds: 3),
               ),
@@ -344,7 +369,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
             );
           }
         },
-        (videoController) {
+        (videoController) async {
           debugPrint('=== LiveStreamScreen: VIDEO SUCCESS CALLBACK ===');
           debugPrint(
             'LiveStreamScreen: Video controller received successfully',
@@ -374,6 +399,19 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
             _videoController!.play();
             _startMetricsMonitoring();
             debugPrint('LiveStreamScreen: Video playback started');
+          }
+
+          // Setup iOS PiP native controller with current stream URL
+          if (Platform.isIOS) {
+            _currentStreamUrl = url;
+            try {
+              await _iosPipChannel.invokeMethod('setStreamUrl', {'url': url});
+              await _iosPipChannel.invokeMethod('enableAutoPip', {
+                'enabled': true,
+              });
+            } catch (e) {
+              debugPrint('iOS PiP setup error: $e');
+            }
           }
         },
       );
@@ -437,6 +475,23 @@ class _LiveStreamScreenState extends State<LiveStreamScreen>
         debugPrint('Quality Change Error: $errorMessage');
       },
     );
+
+    // Update iOS PiP stream URL to match new quality
+    if (Platform.isIOS && _basePlaybackUrl != null) {
+      String newUrl = _currentQuality == 'Auto'
+          ? _basePlaybackUrl!
+          : Uri.parse(_basePlaybackUrl!)
+                .replace(
+                  queryParameters: {'quality': _currentQuality.toLowerCase()},
+                )
+                .toString();
+      _currentStreamUrl = newUrl;
+      try {
+        await _iosPipChannel.invokeMethod('setStreamUrl', {'url': newUrl});
+      } catch (e) {
+        debugPrint('iOS PiP update url error: $e');
+      }
+    }
   }
 
   Widget _buildVideoPlayer() {
